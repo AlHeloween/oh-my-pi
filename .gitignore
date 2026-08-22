@@ -91,3 +91,9 @@ packages/coding-agent/bench/boot-baseline.json
 /bazel-pi
 /bazel-oh-my-pi
 /.bazelrc.user
+
+.smit
+
+_FOSSIL_
+.fossil-settings
+.codegraph
