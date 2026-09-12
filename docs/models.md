@@ -85,6 +85,11 @@ providers:
             controller: mlx
 ```
 
+### Compaction options
+
+- `compactionModel` (per model, including `modelOverrides`) — selector for the model used to summarize/compact context when this model's session is compacted, instead of the model itself.
+- `remoteCompaction` (provider level or per model) — opts eligible models into provider-native compaction. Supported keys: `enabled`, `api`, `endpoint`, `model`, `v2StreamingEnabled`, `v2Endpoint`, `streamingEndpoint`. Provider-level settings are the baseline; per-model keys override them.
+
 ### Allowed provider/model `api` values
 
 - `openai-completions`
@@ -101,6 +106,7 @@ providers:
 
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, `openai-models-list`, `proxy`, or `litellm`
+- `discovery.injectV1`: optional boolean, default `true`, for `openai-models-list`. Set `false` to fetch the model list from `{baseUrl}/models` without injecting `/v1` — for gateways that root their OpenAI-compatible surface at a versioned path (e.g. `https://api.opper.ai/v3/compat`) where the forced `/v1/models` returns a different, smaller model list. Query strings in `baseUrl` are ignored, matching the default mode.
 - `transport`: `pi-native` only. When set, every model under that provider is sent to an `omp auth-gateway` compatible `baseUrl` via `POST /v1/pi/stream`; `apiKey` is the gateway bearer.
 - `imageInputDecoder`: `stb` only. Set this on a custom model or `modelOverrides` entry when the serving backend uses an STB-compatible image decoder that cannot accept WebP; OMP converts attached and historical WebP images before provider dispatch.
 - `tokenizer`: opt into a specific embedded local tokenizer when a proxy's model id is ambiguous or noncanonical. Allowed values: `claude-v3`, `claude-v47`, `claude-v5`, `claude-v5-sonnet`, `qwen3`, `deepseek-v3`, `kimi-k2`, and `glm5`. Omit it to use catalog identity policy; unknown models retain the fast local estimate.
@@ -170,7 +176,7 @@ ModelRegistry pipeline (on refresh):
 5. Merge custom `models`:
    - same `provider + id` replaces existing
    - otherwise append
-6. Load cached/runtime-discovered models (Ollama, llama.cpp, LM Studio, plus built-in provider managers), then re-apply model overrides.
+6. Load cached and runtime-discovered models. This includes local servers, built-in provider managers, and the shared models.dev catalog for known providers. Re-apply model overrides after the merge.
 
 ### Provider-model cache and static fingerprint
 
@@ -182,6 +188,14 @@ catalog matches the cached one, the cached rows are returned verbatim —
 the static + dynamic merge is bypassed entirely. The fingerprint is
 memoized per process by tagging the static-models array with a symbol
 property, so repeated cold-start calls do not re-hash.
+
+### Shared catalog refresh
+
+The bundled catalog remains the startup and offline baseline. After startup loads bundled and cached rows synchronously, the existing background refresh lifecycle fetches the current shared models.dev catalog for known providers. New model IDs are merged additively into each provider's bundled slice, normalized through that provider's catalog descriptor, and persisted in the model-cache database. This allows newly published models to appear without waiting for a new OMP binary.
+
+Remote rows can supply current limits, pricing, modalities, and capability flags for newly added IDs, but they cannot introduce code, arbitrary headers, or an unregistered provider. A successful provider endpoint discovery remains authoritative for account availability. The shared catalog is not authoritative: it does not remove bundled models when a remote row disappears.
+
+Fresh cached snapshots avoid a network request. If refresh fails, OMP keeps the last usable cached snapshot and marks it stale; without a cache, it falls back to the bundled catalog. Provider discovery state records `source` (`bundled`, `models.dev`, `provider`, or `cache`) and `fetchedAt` so callers can distinguish current remote data from an offline fallback.
 
 ## Provider and model identity
 
@@ -199,6 +213,24 @@ Provider defaults vs per-model overrides:
   `remoteCompaction`).
 - `compat` is deep-merged for nested routing blocks (`openRouterRouting`, `vercelGatewayRouting`,
   `extraBody`, and `whenThinking`).
+
+## Usage costs and time-based pricing
+
+OMP estimates token costs from the selected provider/model's catalog pricing, preferring server-reported monetary costs when available. Completed messages retain their recorded costs: crossing a pricing boundary, switching models, or reopening a session does not reprice accumulated usage.
+
+For the first-party `deepseek` provider, the catalog follows [DeepSeek's official pricing](https://api-docs.deepseek.com/quick_start/pricing):
+
+- Peak hours are **Monday–Friday, 01:00–04:00 and 06:00–10:00 UTC** (start inclusive, end exclusive). All other times, including weekends, cost **50% of peak rates**.
+- Flash pricing covers `deepseek-flash` and the retired-but-still-accepted `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` ids, all billed at the Flash card. Peak rates per million tokens are $0.30 uncached input, $0.006 cached input, and $1.20 output.
+- `deepseek-v4-pro` initially uses peak rates of $1.32 uncached input, $0.044 cached input, and $3.96 output per million tokens. From **2026-09-14 04:00 UTC**, its estimates use the Flash rate card, with the same peak/off-peak schedule.
+
+Local estimates use the assistant message's **request-start timestamp** to choose both the rate card and tariff for the whole request. This is OMP's estimation convention: DeepSeek's pricing page does not specify how its server bills a request spanning a boundary. A request whose timestamp cannot be recovered is left unpriced rather than estimated against a tariff chosen from the wall clock.
+
+The status line's `cost` segment appends **↑** for peak or **↓** for off-peak pricing on the **currently active provider/model**, using the current wall clock. It refreshes at tariff boundaries even while idle; the arrow is not a label for the accumulated session total. Models without scheduled pricing, including explicit flat-price overrides, show no arrow.
+
+An explicit model `cost` in `models.yml`, including `modelOverrides`, is a flat-price override and disables inherited time-based pricing for that model. Omitting `cost` preserves catalog pricing. `models.yml` does **not** accept a `timeBased` schedule; that metadata belongs to the catalog's [KDL pricing rules](../packages/catalog/src/compat/rules/README.md#time-based-pricing).
+
+A custom model in `models.yml` that omits `cost` inherits its reference row's card, schedule included. That lookup is keyed by model id and prefers the row with the widest limits, so `deepseek-v4-flash` resolves to a reseller's flat card while `deepseek-flash` resolves to the scheduled first-party one. Discovered proxy and gateway models are the opposite case: their pricing is provider-specific and rarely matches the bundled catalog, so discovery keeps them at a local-unknown zero cost and no tariff applies to them.
 
 ## Runtime discovery integration
 
@@ -377,6 +409,22 @@ So a model can exist in registry but not be selectable until auth is available.
 `--provider` is legacy; `--model` is preferred. An exact `provider/modelId` is unambiguous; bare ids
 and fuzzy patterns are resolved against the available concrete models.
 
+Resolution precedence for exact selectors:
+
+1. exact `provider/modelId` reference
+2. exact bare id (case-insensitive); when several providers carry the same id, a preference ranking picks the winner (see below)
+3. retired effort-tier variant alias (collapsed catalog entries, e.g. `X`/`X-thinking` twins)
+4. provider-scoped fuzzy match, then substring matching with an alias-vs-dated pick
+
+Glob scope patterns (used by `enabledModels` and CLI `--models`) run separately over concrete models after exact matching.
+
+When a bare id matches models from multiple providers, preference order is:
+
+1. recently used model variants
+2. provider priority (`modelProviderOrder` setting, then built-in catalog provider priority)
+3. recently used providers
+4. registry order
+
 ### Initial model selection priority
 
 `findInitialModel(...)` uses this order:
@@ -391,7 +439,7 @@ and fuzzy patterns are resolved against the available concrete models.
 
 Supported model roles:
 
-- `default`, `smol`, `slow`, `vision`, `plan`, `designer`, `commit`, `tiny`, `task`, `advisor`
+- `default`, `smol`, `slow`, `vision`, `plan`, `commit`, `tiny`, `task`, `advisor`
 
 The `tiny` role overrides the online model used for lightweight background tasks (session titles, memory, `auto`-thinking difficulty classification, unexpected-stop detection); when unset, these fall back to `@smol`. Pick one in `/models`.
 
@@ -429,8 +477,16 @@ String entries apply everywhere. Scoped entries apply when the current working d
 
 ## `/model` and `omp models`
 
-Both surfaces keep provider-prefixed concrete models visible and selectable. Selecting a provider
-row stores its explicit `provider/modelId`.
+Both surfaces keep provider-prefixed concrete models visible and selectable.
+
+- `/model` shows an all-models view plus one view per provider
+- `omp models` (default `ls` action) prints provider-grouped tables of every available model; `omp models find <substring>` filters by provider, id, or name; `omp models refresh` forces an online catalog re-fetch ignoring the model cache TTL; any provider name doubles as an `ls` filter (e.g. `omp models openai-codex`). Flags: `--json`, `-e <path>` (load extension, repeatable), `--no-extensions`, `--config <overlay>` (extra config overlay, repeatable)
+
+Selecting a provider row stores its explicit `provider/modelId`.
+
+The table's `images` column reports what the transport will actually send, so a model whose images are
+stripped (`compat.stripImageInput`, see [Image handling](#compatibility-and-routing-fields)) shows `no`
+even when its spec declares `input: [text, image]`; `--json` keeps the declared `input`.
 
 ## Context promotion (model-level fallback chains)
 
@@ -512,7 +568,24 @@ Request shaping:
   mode where the endpoint supports it.
 - `extraBody` — extra top-level fields merged into every request body (gateway hints, controller selectors, etc.).
 
+Image handling:
+
+- `stripImageInput` — drop image parts before an `openai-completions` request is encoded (including the OpenRouter chat fallback, `PI_OPENROUTER_RESPONSES=0`). The catalog's
+  class rules set it for model lines that endpoints commonly serve as text-only (e.g. the DeepSeek class),
+  independently of the provider's own `input` declaration, so a model can declare `input: [text, image]`
+  and still send no image. Per-model `compat` is deep-merged over those rules and wins: set
+  `stripImageInput: false` for an id whose endpoint really accepts `image_url` — a vision-augmenting
+  proxy, for example. Default: auto (catalog class and provider rules). The Responses and Anthropic/Google
+  encoders ship the modalities the model declares, as does the `pi-native` transport (it forwards the
+  original context to the gateway, so the guard never runs client-side and the `images` column reports
+  the declared `input`).
+
 Reasoning / thinking:
+
+Custom model entries may define `thinking: { mode, efforts, defaultLevel, requiresEffort }`.
+`requiresEffort` defaults to auto-detection; set it to `false` only when the
+configured backend has been verified to accept an explicit reasoning-off
+request. This keeps the `:off` selector from being clamped to the lowest effort.
 
 - `supportsReasoningEffort` — accept `reasoning_effort`. Default: auto (off for Grok, Z.ai/Zhipu, and Xiaomi MiMo).
 - `supportsReasoningParams` — whether request shaping may send reasoning params at all. Default: auto (off for GitHub Copilot chat-completions).

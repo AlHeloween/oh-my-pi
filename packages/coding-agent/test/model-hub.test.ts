@@ -15,7 +15,7 @@ import {
 	type ModelHubOptions,
 	resetProviderAutoRefreshGuard,
 } from "@oh-my-pi/pi-coding-agent/modes/components/model-hub";
-import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
 import type { TUI } from "@oh-my-pi/pi-tui";
 
@@ -28,7 +28,7 @@ function footerLine(lines: readonly string[]): string {
 	return stripVTControlCharacters(lines[lines.length - 2] ?? "");
 }
 
-function makeModel(provider: string, id: string, contextWindow = 128_000): Model {
+function makeModel(provider: string, id: string, contextWindow = 128_000, cost?: Model["cost"]): Model {
 	return buildModel({
 		id,
 		name: id,
@@ -37,7 +37,7 @@ function makeModel(provider: string, id: string, contextWindow = 128_000): Model
 		baseUrl: "https://example.com",
 		reasoning: false,
 		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		cost: cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow,
 		maxTokens: 1024,
 	});
@@ -286,6 +286,78 @@ describe("ModelHub", () => {
 			expect(normalize(hub.render(220))).toContain("prov-a ·");
 			expect(footerLine(hub.render(220))).not.toContain("→ roles");
 		});
+
+		test("provider sidebar counts agree with the free keyword", () => {
+			// Regression: the sidebar counts come from the hub's own filter, so
+			// if only the browser learned the cost keyword a free provider would
+			// render 0, gray out, and drop out of the scope hop while its rows
+			// were still listed.
+			const { hub } = createHub({
+				models: [
+					makeModel("nvidia", "nemotron-3-nano"),
+					makeModel("anthropic", "claude-sonnet-4-5", 128_000, {
+						input: 3,
+						output: 15,
+						cacheRead: 0.3,
+						cacheWrite: 3.75,
+					}),
+				],
+			});
+			installTestTheme();
+
+			for (const ch of "free") hub.handleInput(ch);
+
+			const rendered = normalize(hub.render(220));
+			expect(rendered).toContain("All models 1");
+			expect(rendered).toContain("nvidia 1");
+			expect(rendered).toContain("anthropic 0");
+		});
+	});
+
+	describe("sidebar rebuild during navigation", () => {
+		test("keeps focus on a surviving provider when the focused entry vanishes on refresh", async () => {
+			vi.useFakeTimers();
+			try {
+				const models = [makeModel("alpha", "m"), makeModel("beta", "m"), makeModel("gamma", "m")];
+				// A keyless discoverable local endpoint: starts visible (discovery
+				// "empty"), then its on-focus refresh finds it unreachable and it
+				// flips to hidden (optional + "unavailable"), vanishing from the list.
+				let localStatus = "empty";
+				const { hub } = createHub({
+					models,
+					registry: {
+						getDiscoverableProviders: () => ["delta-local"],
+						getProviderDiscoveryState: providerId =>
+							providerId === "delta-local" ? { optional: true, status: localStatus } : undefined,
+						refreshProvider: async providerId => {
+							if (providerId === "delta-local") localStatus = "unavailable";
+						},
+					},
+				});
+				installTestTheme();
+
+				// Sidebar order: Roles, All models, [sep], alpha, beta, delta-local, gamma.
+				// Hop down onto the keyless provider, which schedules its refresh.
+				hub.handleInput(DOWN); // all → alpha
+				hub.handleInput(DOWN); // alpha → beta
+				hub.handleInput(DOWN); // beta → delta-local
+				expect(normalize(hub.render(220))).toContain("delta-local ·");
+
+				// Fire the debounced on-focus refresh, then flush the async rebuild
+				// (refreshProvider resolves on a microtask before #syncFromRegistryState).
+				vi.advanceTimersByTime(200);
+				await Promise.resolve();
+				await Promise.resolve();
+
+				// delta-local is gone; focus must land on the neighbouring provider,
+				// not snap back to "All models" at the top.
+				const rendered = normalize(hub.render(220));
+				expect(rendered).not.toContain("All available models");
+				expect(rendered).toContain("gamma ·");
+			} finally {
+				vi.useRealTimers();
+			}
+		});
 	});
 
 	describe("typing focus", () => {
@@ -387,6 +459,23 @@ describe("ModelHub", () => {
 			expect(previewText.indexOf("smol")).toBeGreaterThan(-1);
 			expect(previewText.indexOf("smol")).toBeLessThan(previewText.indexOf("default"));
 			expect(previewText.indexOf("default")).toBeLessThan(previewText.indexOf("slow"));
+		});
+
+		test("separates the quick-cycle icon from its ordinal", () => {
+			const model = makeModel("test", "cycle-model");
+			const settings = Settings.isolated({
+				cycleOrder: ["default"],
+				modelRoles: { default: `${model.provider}/${model.id}` },
+			});
+			const { hub } = createHub({ models: [model], scoped: true, settings });
+
+			hub.handleInput(UP); // All models → Roles.
+			const defaultRow = hub
+				.render(220)
+				.map(line => stripVTControlCharacters(line))
+				.find(line => line.includes("DEFAULT"));
+
+			expect(defaultRow).toContain(`${theme.icon.loop} 1`);
 		});
 
 		test("the + New role row names a custom role and jumps into assigning it", () => {

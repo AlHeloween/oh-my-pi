@@ -92,8 +92,12 @@ packages/coding-agent/bench/boot-baseline.json
 /bazel-oh-my-pi
 /.bazelrc.user
 
+<<<<<<< HEAD
 .smit
 
 _FOSSIL_
 .fossil-settings
 .codegraph
+=======
+.parity/
+>>>>>>> main

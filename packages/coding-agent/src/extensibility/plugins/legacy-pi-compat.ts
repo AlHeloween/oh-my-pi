@@ -1,3 +1,4 @@
+// oxlint-disable-next-line typescript/triple-slash-reference -- legacy virtual module declarations.
 /// <reference path="./legacy-pi-virtual-modules.d.ts" />
 
 import { Database } from "bun:sqlite";
@@ -8,6 +9,7 @@ import * as url from "node:url";
 import type { ParseResult, ParserPlugin } from "@babel/parser";
 import { parse as parseBabel } from "@babel/parser";
 import {
+	getDbBusyTimeoutMs,
 	getLegacyPiExtensionCacheDbPath,
 	isCompiledBinary,
 	logger,
@@ -15,7 +17,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { registerPluginCacheInvalidator } from "../../discovery/helpers";
 
-const IS_COMPILED_BINARY = isCompiledBinary();
+const USE_BUNDLED_PI_MODULES = isCompiledBinary() || Boolean(process.env.PI_BUNDLED);
 
 // === Bundled host modules (issue #3423) ===
 //
@@ -25,8 +27,8 @@ const IS_COMPILED_BINARY = isCompiledBinary();
 // embedded entries. Bun.plugin `onResolve` also no longer fires for transitive
 // imports inside runtime-loaded extensions.
 //
-// Compiled builds retain lazy loaders for host packages and serve requested
-// surfaces through `omp-legacy-pi-bundled:<key>` synthetic modules.
+// Compiled binaries and npm bundles retain lazy loaders for host packages and
+// serve requested surfaces through `omp-legacy-pi-bundled:<key>` synthetic modules.
 // `scripts/legacy-pi-virtual-module.ts` derives literal dynamic-import edges
 // from current package exports inside a Bun build plugin: no generated source
 // or duplicate key list exists on disk. Deferring each host module evaluation
@@ -574,16 +576,32 @@ function getExtensionParseCacheDb(): Database | null {
 		const cachePath = getLegacyPiExtensionCacheDbPath();
 		try {
 			if (fs.statSync(cachePath).size > EXTENSION_PARSE_CACHE_MAX_BYTES) {
-				fs.rmSync(cachePath, { force: true });
+				// Remove the full WAL set, not just the main db. A leftover
+				// `-wal`/`-shm` pair still owned by a concurrent omp process is
+				// adopted by this fresh connection; when that `-wal` has
+				// uncheckpointed frames (the normal case while another omp is
+				// writing its own cache entries), `journal_mode=WAL` fails with
+				// SQLITE_IOERR — disabling the parse cache for the whole process
+				// and forcing a reparse of every extension on startup. See #9549.
+				for (const suffix of ["", "-wal", "-shm"]) {
+					fs.rmSync(`${cachePath}${suffix}`, { force: true });
+				}
 			}
 		} catch {
 			// A missing or unreadable cache is a cold cache.
 		}
 		fs.mkdirSync(path.dirname(cachePath), { recursive: true });
 		const db = new Database(cachePath, { create: true });
-		db.run("PRAGMA busy_timeout = 50");
+		// Install the busy handler BEFORE any lock-taking statement (incl.
+		// `PRAGMA journal_mode=WAL`, which takes an exclusive lock during WAL
+		// recovery). See #2421. WAL + synchronous=NORMAL avoids the per-entry
+		// journal create/delete + fsync churn that serialized this cache behind
+		// concurrent omp startups and blocked the event loop for ~20s (#9549).
+		db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
+		db.run("PRAGMA journal_mode=WAL");
+		db.run("PRAGMA synchronous=NORMAL");
 		db.run(
-			"CREATE TABLE IF NOT EXISTS extension_parse_cache (cache_key TEXT PRIMARY KEY, source_type TEXT NOT NULL, references TEXT NOT NULL, commonjs_named_exports TEXT NOT NULL, commonjs_reexport_specifiers TEXT NOT NULL)",
+			"CREATE TABLE IF NOT EXISTS extension_parse_cache (cache_key TEXT PRIMARY KEY, source_type TEXT NOT NULL, [references] TEXT NOT NULL, commonjs_named_exports TEXT NOT NULL, commonjs_reexport_specifiers TEXT NOT NULL)",
 		);
 		extensionParseCacheDb = db;
 		return db;
@@ -594,6 +612,15 @@ function getExtensionParseCacheDb(): Database | null {
 		extensionParseCacheDb = null;
 		return null;
 	}
+}
+
+/**
+ * Test seam: whether the extension parse cache opened successfully. Exercises
+ * the real eviction + open path, including full WAL-set cleanup on oversized
+ * caches (#9549).
+ */
+export function __isExtensionParseCacheAvailableForTests(): boolean {
+	return getExtensionParseCacheDb() !== null;
 }
 
 function parseCachedAnalysis(row: ExtensionParseCacheRow): ExtensionSourceAnalysis | null {
@@ -637,7 +664,7 @@ function writeExtensionSourceAnalysis(cacheKey: string, analysis: ExtensionSourc
 			const db = getExtensionParseCacheDb();
 			if (!db) return;
 			db.run(
-				"INSERT OR REPLACE INTO extension_parse_cache (cache_key, source_type, references, commonjs_named_exports, commonjs_reexport_specifiers) VALUES (?, ?, ?, ?, ?)",
+				"INSERT OR REPLACE INTO extension_parse_cache (cache_key, source_type, [references], commonjs_named_exports, commonjs_reexport_specifiers) VALUES (?, ?, ?, ?, ?)",
 				[
 					cacheKey,
 					analysis.sourceType,
@@ -668,7 +695,7 @@ function getExtensionSourceAnalysis(source: string, importerPath: string): Exten
 	try {
 		const row = db
 			?.query<ExtensionParseCacheRow, [string]>(
-				"SELECT source_type, references, commonjs_named_exports, commonjs_reexport_specifiers FROM extension_parse_cache WHERE cache_key = ?",
+				"SELECT source_type, [references], commonjs_named_exports, commonjs_reexport_specifiers FROM extension_parse_cache WHERE cache_key = ?",
 			)
 			.get(cacheKey);
 		if (row) {
@@ -714,12 +741,12 @@ let bundledModuleLoadersPromise: Promise<BundledModuleLoaders> | null = null;
  * Load the build-supplied module registry without evaluating its host modules.
  *
  * `globalThis` bridges the synthetic ES modules, which cannot close over this
- * file's lexical scope. Dev/test runs never execute the conditional import;
- * binary builds resolve it through the in-memory build plugin.
+ * file's lexical scope. Source runs never execute the conditional import;
+ * binary and npm builds resolve it through the in-memory build plugin.
  */
 function ensureBundledModuleLoadersLoaded(): Promise<BundledModuleLoaders> {
-	if (!IS_COMPILED_BINARY) {
-		return Promise.reject(new Error("omp:legacy-pi-shim: bundled modules are only available in compiled mode"));
+	if (!USE_BUNDLED_PI_MODULES) {
+		return Promise.reject(new Error("omp:legacy-pi-shim: bundled modules are only available in bundled mode"));
 	}
 	if (!bundledModuleLoadersPromise) {
 		bundledModuleLoadersPromise = import("omp-legacy-pi-modules").then(module => {
@@ -950,24 +977,24 @@ function sourceShimPath(file: string): string {
  * TypeBox facade with legacy `Type.Unsafe`, then drop the remap when that
  * entrypoint is missing.
  *
- * In compiled-binary mode the surface is served through the
- * `omp-legacy-pi-bundled:` virtual namespace (issue #3423). Dev, source-link,
- * and installed-package modes use the shipped source module.
+ * In compiled binaries and npm bundles the surface is served through the
+ * `omp-legacy-pi-bundled:` virtual namespace (issue #3423). Dev and source SDK
+ * imports use the shipped source module.
  *
  * Exported for tests; production callers use `TYPEBOX_SHIM_PATH`.
  */
 export function __resolveTypeBoxShimPath(
-	isCompiled: boolean,
+	useBundledModules: boolean,
 	sourcePath: string,
 	pathExistsSync: (p: string) => boolean = fs.existsSync,
 ): string | null {
-	if (isCompiled) {
+	if (useBundledModules) {
 		return bundledModuleVirtualSpecifier(TYPEBOX_BUNDLED_MODULE_KEY);
 	}
 	return pathExistsSync(sourcePath) ? sourcePath : null;
 }
 
-const TYPEBOX_SHIM_PATH = __resolveTypeBoxShimPath(IS_COMPILED_BINARY, sourceShimPath("legacy-typebox.ts"));
+const TYPEBOX_SHIM_PATH = __resolveTypeBoxShimPath(USE_BUNDLED_PI_MODULES, sourceShimPath("legacy-typebox.ts"));
 
 // Legacy extensions historically imported `Type` (and `Static`/`TSchema`) from
 // the package root of `@(scope)/pi-ai`. pi-ai 15.1.0 removed the runtime `Type`
@@ -977,48 +1004,47 @@ const TYPEBOX_SHIM_PATH = __resolveTypeBoxShimPath(IS_COMPILED_BINARY, sourceShi
 // plus the borrowed `Type` runtime from the omptype TypeBox facade. Subpath
 // imports such as `@oh-my-pi/pi-ai/oauth` continue to resolve directly
 // against the bundled pi-ai package.
-const LEGACY_PI_AI_SHIM_PATH = IS_COMPILED_BINARY
+const LEGACY_PI_AI_SHIM_PATH = USE_BUNDLED_PI_MODULES
 	? bundledModuleVirtualSpecifier(`${CANONICAL_PI_SCOPE}/pi-ai`)
 	: sourceShimPath("legacy-pi-ai-shim.ts");
 
 // The coding-agent's own `./src/index.ts` cannot be listed as an extra
 // `bun --compile` entrypoint alongside the CLI entry without breaking binary
-// startup (issue #1474 follow-up). In compiled-binary mode the legacy
-// `@(scope)/pi-coding-agent` root therefore resolves through the bundled
-// module shim; in dev / source-link / installed-package mode it points at the
-// sibling source shim whose distinct file path avoids the #1474 collision
+// startup (issue #1474 follow-up). In compiled binaries and npm bundles the
+// legacy `@(scope)/pi-coding-agent` root therefore resolves through the bundled
+// module shim; in dev / source-link / source SDK mode it points at the sibling
+// source shim whose distinct file path avoids the #1474 collision
 // while still re-exporting the canonical package surface.
-const LEGACY_PI_CODING_AGENT_SHIM_PATH = IS_COMPILED_BINARY
+const LEGACY_PI_CODING_AGENT_SHIM_PATH = USE_BUNDLED_PI_MODULES
 	? bundledModuleVirtualSpecifier(`${CANONICAL_PI_SCOPE}/pi-coding-agent`)
 	: sourceShimPath("legacy-pi-coding-agent-shim.ts");
 
 // Legacy pi-tui exported `decodeKittyPrintable` from its package root. The
 // canonical TUI replaced it with the broader `decodePrintableKey`; route only
 // legacy root imports through a sibling shim that preserves the old name.
-const LEGACY_PI_TUI_SHIM_PATH = IS_COMPILED_BINARY
+const LEGACY_PI_TUI_SHIM_PATH = USE_BUNDLED_PI_MODULES
 	? bundledModuleVirtualSpecifier(`${CANONICAL_PI_SCOPE}/pi-tui`)
 	: sourceShimPath("legacy-pi-tui-shim.ts");
 
 // Package-root overrides. Shim entries (`pi-ai`, `pi-coding-agent`, `pi-tui`)
 // always replace the canonical surface so legacy helpers stay reachable. The
 // other bundled host packages (`pi-agent-core`, `pi-natives`, `pi-utils`) are
-// added only in compiled-binary mode to route extensions onto the in-process
-// module instance — in dev / source-link / installed-package mode the canonical
-// specifier resolves cleanly through `Bun.resolveSync` and hardcoding a
+// added in compiled binaries and npm bundles to route extensions onto the
+// in-process module instance — in dev / source-link / source SDK mode the
+// canonical specifier resolves cleanly through `Bun.resolveSync`; hardcoding a
 // source-tree path would miss installs where bundled packages live at
 // `node_modules/@oh-my-pi/pi-*`.
 //
-// Compiled-binary entries are `omp-legacy-pi-bundled:<key>` specifiers handed
-// to the synthetic onLoad in `installLegacyPiSpecifierShim()` — bunfs paths
-// are unusable on Bun 1.3.14+ (issue #3423). Filesystem-shaped overrides are
-// still validated against on-disk presence so a missing dev-mode shim falls
-// through to `getResolvedSpecifier`.
+// Bundled entries are `omp-legacy-pi-bundled:<key>` specifiers handed to the
+// synthetic onLoad in `installLegacyPiSpecifierShim()`. Filesystem-shaped
+// overrides are still validated against on-disk presence so a missing dev-mode
+// shim falls through to `getResolvedSpecifier`.
 
 /**
  * Drop overrides whose filesystem targets are missing so they can fall
  * through to the canonical-resolution path. Virtual `omp-legacy-pi-bundled:`
- * entries always pass — live bundled module references are the source of truth
- * in compiled mode where bunfs paths are unreachable (issue #3423).
+ * entries always pass because live bundled module references are the source of
+ * truth.
  *
  * `pathExistsSync` defaults to `fs.existsSync`; tests inject a stub to
  * simulate the missing-entrypoint failure mode without touching the real FS.
@@ -1040,12 +1066,12 @@ export function __validateLegacyPiPackageRootOverrides(
 /**
  * Compute the override map keyed by every canonical specifier the host serves
  * directly: the pi-ai / pi-coding-agent roots (compat shims that re-attach
- * legacy helpers) plus, in compiled mode, every build-supplied module key.
+ * legacy helpers) plus, in bundled mode, every build-supplied module key.
  * Subpath coverage stops `@(scope)/pi-ai/oauth` and friends from falling
- * through to the extension's absent peer install when bunfs walks fail.
+ * through to the extension's absent peer install.
  */
 export function __buildLegacyPiPackageRootOverrides(
-	isCompiled: boolean,
+	useBundledModules: boolean,
 	bundledModuleKeys: Iterable<string> = [],
 ): Record<string, string> {
 	const candidates: Record<string, string> = {
@@ -1053,7 +1079,7 @@ export function __buildLegacyPiPackageRootOverrides(
 		[`${CANONICAL_PI_SCOPE}/pi-coding-agent`]: LEGACY_PI_CODING_AGENT_SHIM_PATH,
 		[`${CANONICAL_PI_SCOPE}/pi-tui`]: LEGACY_PI_TUI_SHIM_PATH,
 	};
-	if (isCompiled) {
+	if (useBundledModules) {
 		for (const key of bundledModuleKeys) {
 			// Shim-bearing roots already map to their compat surfaces; TypeBox
 			// has a dedicated TYPEBOX_SHIM_PATH route.
@@ -1064,14 +1090,14 @@ export function __buildLegacyPiPackageRootOverrides(
 	return __validateLegacyPiPackageRootOverrides(candidates);
 }
 
-// Seeded with compat roots at module init; first compiled extension load adds
+// Seeded with compat roots at module init; first bundled extension load adds
 // every key supplied by the in-memory build module.
-let legacyPiPackageRootOverrides = __buildLegacyPiPackageRootOverrides(IS_COMPILED_BINARY);
+let legacyPiPackageRootOverrides = __buildLegacyPiPackageRootOverrides(USE_BUNDLED_PI_MODULES);
 let legacyPiOverridesReadyPromise: Promise<void> | null = null;
 
-/** Complete compiled-mode overrides from the lazy host-module registry. */
+/** Complete bundled-mode overrides from the lazy host-module registry. */
 function ensureLegacyPiOverridesReady(): Promise<void> {
-	if (!IS_COMPILED_BINARY) {
+	if (!USE_BUNDLED_PI_MODULES) {
 		return Promise.resolve();
 	}
 	if (!legacyPiOverridesReadyPromise) {
@@ -1182,7 +1208,7 @@ async function rewriteLegacyExtensionSource(
 			replacement = toImportSpecifier(TYPEBOX_SHIM_PATH);
 		}
 		if (!replacement && specifier.startsWith("#")) {
-			const resolved = await resolvePackageImportSpecifier(specifier, importerPath);
+			const resolved = packageImportPath(specifier, await resolvePackageImportSpecifier(specifier, importerPath));
 			if (resolved) replacement = toGraphImportSpecifier(resolved, resolvedImportMtimeTag);
 		}
 		if (!replacement && isBareExtensionDependencySpecifier(specifier)) {
@@ -1406,8 +1432,12 @@ async function resolvePackageImportTarget(
 	const substituted = wildcard === null ? target : target.replaceAll("*", wildcard);
 	return resolvePackageSourceTarget(packageRoot, path.resolve(packageRoot, substituted));
 }
+type PackageImportResolution = string | typeof PACKAGE_IMPORT_EXCLUDED | null;
 
-async function resolvePackageImportSpecifier(specifier: string, importerPath: string): Promise<string | null> {
+async function resolvePackageImportSpecifier(
+	specifier: string,
+	importerPath: string,
+): Promise<PackageImportResolution> {
 	if (!specifier.startsWith("#")) {
 		return null;
 	}
@@ -1424,7 +1454,7 @@ async function resolvePackageImportSpecifier(specifier: string, importerPath: st
 
 	const exactTarget = selectPackageImportTarget(imports[specifier]);
 	if (exactTarget === PACKAGE_IMPORT_EXCLUDED) {
-		return null;
+		return PACKAGE_IMPORT_EXCLUDED;
 	}
 	if (exactTarget !== null) {
 		return resolvePackageImportTarget(packageRoot, exactTarget, null);
@@ -1456,9 +1486,15 @@ async function resolvePackageImportSpecifier(specifier: string, importerPath: st
 	}
 
 	if (!bestMatch || bestMatch.target === PACKAGE_IMPORT_EXCLUDED) {
-		return null;
+		return bestMatch?.target ?? null;
 	}
 	return resolvePackageImportTarget(packageRoot, bestMatch.target, bestMatch.wildcard);
+}
+function packageImportPath(specifier: string, resolution: PackageImportResolution): string | null {
+	if (resolution === PACKAGE_IMPORT_EXCLUDED) {
+		throw new Error(`Package import "${specifier}" is excluded by its package imports map`);
+	}
+	return resolution;
 }
 
 function isBareExtensionDependencySpecifier(specifier: string): boolean {
@@ -1610,6 +1646,20 @@ async function isCommonJsModulePath(
 		sourceType ?? getExtensionSourceAnalysis(await Bun.file(modulePath).text(), modulePath).sourceType;
 	if (parsedSourceType === "module") {
 		return false;
+	}
+	if (parsedSourceType === "script") {
+		const ast = parseExtensionSource(await Bun.file(modulePath).text(), modulePath);
+		const hasUnshadowedCommonJsSyntax = collectScopedAstNodes(
+			ast,
+			node => node.type === "CallExpression" || node.type === "MemberExpression",
+		).some(({ node, scope }) => {
+			if (isGlobalRequireCall(node, scope)) return true;
+			if (node.type !== "MemberExpression") return false;
+			return isUnshadowedExportsTarget(node, scope) || isUnshadowedExportsTarget(asAstNode(node.object), scope);
+		});
+		if (hasUnshadowedCommonJsSyntax) {
+			return true;
+		}
 	}
 	if (inheritedKind) {
 		return inheritedKind === "commonjs";
@@ -1788,8 +1838,8 @@ async function isSelectedNoTypeEsmPackageBranch(
 	);
 	return Boolean(
 		importTarget &&
-			path.resolve(importTarget) === path.resolve(resolvedPath) &&
-			(!requireTarget || path.resolve(requireTarget) !== path.resolve(importTarget)),
+		path.resolve(importTarget) === path.resolve(resolvedPath) &&
+		(!requireTarget || path.resolve(requireTarget) !== path.resolve(importTarget)),
 	);
 }
 
@@ -1947,7 +1997,10 @@ async function rewriteExtensionSpecifiers(
 				const candidate = Bun.resolveSync(reference.specifier, path.dirname(importerPath));
 				resolved = hasSourceModuleExtension(candidate) ? await realpathOrSelf(candidate) : null;
 			} else if (reference.specifier.startsWith("#")) {
-				resolved = await resolvePackageImportSpecifier(reference.specifier, importerPath);
+				resolved = packageImportPath(
+					reference.specifier,
+					await resolvePackageImportSpecifier(reference.specifier, importerPath),
+				);
 			} else {
 				resolved = await resolveExtensionBareDependency(reference.specifier, importerPath);
 			}
@@ -2248,7 +2301,7 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 						}
 					}
 				} else if (specifier.startsWith("#")) {
-					const candidate = await resolvePackageImportSpecifier(specifier, file);
+					const candidate = packageImportPath(specifier, await resolvePackageImportSpecifier(specifier, file));
 					if (candidate) {
 						const inheritedTargetKind = isRequired
 							? sourceIsCommonJs

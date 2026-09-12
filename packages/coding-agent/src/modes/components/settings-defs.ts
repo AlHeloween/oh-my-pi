@@ -96,10 +96,18 @@ export type SettingDef =
 // ═══════════════════════════════════════════════════════════════════════════
 
 const CONDITIONS: Record<string, () => boolean> = {
+	macOS: () => process.platform === "darwin",
 	hasImageProtocol: () => !!TERMINAL.imageProtocol,
 	advisorEnabled: () => {
 		try {
 			return Settings.instance.get("advisor.enabled") === true;
+		} catch {
+			return false;
+		}
+	},
+	vimModeEnabled: () => {
+		try {
+			return Settings.instance.get("tui.vimMode") === true;
 		} catch {
 			return false;
 		}
@@ -142,6 +150,20 @@ const CONDITIONS: Record<string, () => boolean> = {
 	planModeEnabled: () => {
 		try {
 			return Settings.instance.get("plan.enabled");
+		} catch {
+			return false;
+		}
+	},
+	planAutosaveEnabled: () => {
+		try {
+			return Settings.instance.get("plan.enabled") && Settings.instance.get("plan.autosave");
+		} catch {
+			return false;
+		}
+	},
+	unexpectedStopSmart: () => {
+		try {
+			return Settings.instance.get("features.unexpectedStopDetection") === "smart";
 		} catch {
 			return false;
 		}

@@ -1,10 +1,17 @@
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@oh-my-pi/pi-tui";
+import {
+	type AutocompleteProvider,
+	matchesKey,
+	parseSgrMouse,
+	type PasteOptions,
+	type SlashCommand,
+} from "@oh-my-pi/pi-tui";
 import { isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveLocalRoot } from "../../internal-urls";
+import { AskDialogComponent } from "../../modes/components/ask-dialog";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import { extractImagePathFromText } from "../../modes/components/custom-editor";
 import { ReadToolGroupComponent } from "../../modes/components/read-tool-group";
@@ -12,25 +19,24 @@ import { renderSegmentTrack } from "../../modes/components/segment-track";
 import { TinyTitleDownloadProgressComponent } from "../../modes/components/tiny-title-download-progress";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { TreeSelectorComponent } from "../../modes/components/tree-selector";
+import { chipLabel, compactImageMarkers, shiftImageMarkers } from "../../modes/composer-attachments";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
-import {
-	chipLabel,
-	compactImageMarkers,
-	materializeImageReferenceLinks,
-	setCachedImageDimensions,
-	shiftImageMarkers,
-} from "../../modes/image-references";
+import { materializeImageReferenceLinks, setCachedImageDimensions } from "../../modes/image-references";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
 import { parseQueueShorthand, splitQueuedMessages } from "../../modes/queue-input";
 import { buildSkillCommandPrompt, isKnownSkillCommand } from "../../modes/skill-command";
 import type { InteractiveModeContext } from "../../modes/types";
 import manualContinuePrompt from "../../prompts/system/manual-continue.md" with { type: "text" };
+import { AgentRegistry } from "../../registry/agent-registry";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
-import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
+import { PINNED_HUD_TOGGLE_ID } from "../composer";
+import { pickRecentFocusableAgentId } from "./session-focus-controller";
+import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { parseSlashCommand } from "../../slash-commands/helpers/parse";
 import { isTinyTitleLocalModelKey } from "../../tiny/models";
 import { tinyTitleClient } from "../../tiny/title-client";
 import type { TinyTitleProgressEvent } from "../../tiny/title-protocol";
+import { resolveReadPath } from "../../tools/path-utils";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
 import { vocalizer } from "../../tts/vocalizer";
 import {
@@ -39,9 +45,17 @@ import {
 	readMacFileUrlsFromClipboard,
 	readTextFromClipboard,
 } from "../../utils/clipboard";
+import { getSlashCommandUsage, loadSlashCommandUsage, recordSlashCommandUsage } from "../../utils/command-usage";
 import { EnhancedPasteController } from "../../utils/enhanced-paste";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError, loadImageInput } from "../../utils/image-loading";
+import {
+	VideoError,
+	buildVideoContactSheetPng,
+	createVideoPreviewImage,
+	isVideoPath,
+	probeVideo,
+} from "../../utils/video";
 import { resizeImage } from "../../utils/image-resize";
 
 /**
@@ -88,6 +102,8 @@ function isExpandable(obj: unknown): obj is Expandable {
 /** Minimal contract for any component that can receive a paste payload directly. */
 interface PasteTarget {
 	pasteText(text: string): void;
+	/** Reserve delivery before an async clipboard read; undefined releases it without text. */
+	beginPaste?(): (text: string | undefined) => boolean;
 }
 
 function hasPasteText(value: unknown): value is PasteTarget {
@@ -179,16 +195,27 @@ export class InputController {
 	) {}
 
 	/** Session-level title starts (user `/skill:` via promptCustomMessage) reuse this UI. */
-	notifyTitleGenerationStart(): void {
-		this.#showTinyTitleDownloadProgress(this.ctx.settings.get("providers.tinyModel"));
+	notifyTitleGenerationStart(): (() => void) | undefined {
+		return this.#showTinyTitleDownloadProgress(this.ctx.settings.get("providers.tinyModel"));
 	}
 
 	#enhancedPaste?: EnhancedPasteController;
+	#draftText: string | undefined;
 	#focusedLeftTapListenerInstalled = false;
 	#focusedPasteListenerInstalled = false;
 	#btwBranchListenerInstalled = false;
 	#btwCopyListenerInstalled = false;
 	#expandToolsListenerInstalled = false;
+	#inlineMouseListenerInstalled = false;
+
+	/** Click-candidate id the hover band currently tracks; repaint only on change. */
+	#lastHoverClickId: string | undefined;
+
+	/** Return the last full editor snapshot delivered by its change contract. */
+	getDraftText(): string {
+		return this.#draftText ?? this.ctx.editor.getText();
+	}
+
 	// Tap counter for the double-← gesture; reset whenever a quiet gap
 	// (>= LEFT_DOUBLE_TAP_MAX_GAP_MS) starts a fresh sequence. See
 	// #detectLeftDoubleTap.
@@ -200,7 +227,7 @@ export class InputController {
 	// scoped-input render fast path so the attachment chips band repaints.
 	#lastChipsSignature = "";
 
-	#showTinyTitleDownloadProgress(modelKey: string): void {
+	#showTinyTitleDownloadProgress(modelKey: string): (() => void) | undefined {
 		if (!isTinyTitleLocalModelKey(modelKey)) return;
 		const component = new TinyTitleDownloadProgressComponent(modelKey);
 		let added = false;
@@ -243,6 +270,7 @@ export class InputController {
 			}
 		};
 		const unsubscribe = tinyTitleClient.onProgress(update);
+		return remove;
 	}
 
 	#abortStreamingTurn(): void {
@@ -250,6 +278,7 @@ export class InputController {
 	}
 
 	setupKeyHandlers(): void {
+		this.#draftText ??= this.ctx.editor.getText();
 		this.ctx.editor.setActionKeys("app.interrupt", this.ctx.keybindings.getKeys("app.interrupt"));
 		if (!this.#focusedLeftTapListenerInstalled) {
 			this.#focusedLeftTapListenerInstalled = true;
@@ -307,15 +336,35 @@ export class InputController {
 				if (this.ctx.ui.hasOverlay()) return undefined;
 				if (this.ctx.ui.getFocused() instanceof TreeSelectorComponent && matchesKey(data, "ctrl+o"))
 					return undefined;
+				const focused = this.ctx.ui.getFocused();
+				// A truncated ask question lives in the editor slot, not chat
+				// transcript, so expand it in-place instead of (or before)
+				// toggling tool-output previews.
+				if (focused instanceof AskDialogComponent && focused.toggleQuestionExpansion()) {
+					return { consume: true };
+				}
 				this.toggleToolOutputExpansion();
 				return { consume: true };
 			});
+		}
+		if (!this.#inlineMouseListenerInstalled) {
+			this.#inlineMouseListenerInstalled = true;
+			// Inline click-to-focus (`tui.mouse`): SGR reports only arrive while
+			// the setting has tracking enabled, so this stays inert otherwise.
+			// Defers to fullscreen overlays, which own mouse handling on the
+			// alternate screen.
+			this.ctx.ui.addInputListener(data => this.#handleInlineMouse(data));
 		}
 		this.ctx.editor.onEscape = () => {
 			// `/mcp test` advertises Esc until each owner's post-settlement grace expires.
 			// Cancel every overlapping test before any main-turn or side-channel action.
 			if (this.ctx.mcpTestEscapeHandlers.size > 0) {
-				for (const handler of this.ctx.mcpTestEscapeHandlers) handler();
+				// One Esc cancels every advertised /mcp test and consumes the ownership;
+				// the next Esc must reach the actions below instead of being swallowed
+				// by a stale registration or grace timer.
+				const handlers = [...this.ctx.mcpTestEscapeHandlers];
+				this.ctx.mcpTestEscapeHandlers.clear();
+				for (const handler of handlers) handler();
 				return;
 			}
 
@@ -425,17 +474,23 @@ export class InputController {
 				// Esc must not destroy an in-progress draft.
 				this.ctx.lastEscapeTime = 0;
 			} else {
-				// Double-interrupt with empty editor triggers /tree, /branch, or nothing based on setting
-				const action = settings.get("doubleEscapeAction");
-				if (action !== "none") {
+				// Double-interrupt with an empty editor runs the configured action:
+				// the transcript rewind selector (default) or the session tree.
+				const doubleEscapeAction = settings.get("doubleEscapeAction");
+				if (doubleEscapeAction !== "none") {
 					const now = Date.now();
 					if (now - this.ctx.lastEscapeTime < 500) {
-						if (action === "tree") {
+						if (doubleEscapeAction === "tree") {
 							this.ctx.showTreeSelector();
 						} else {
 							this.ctx.showUserMessageSelector();
 						}
-						this.ctx.ui.resetDisplay();
+						// Forced viewport repaint only: `resetDisplay()` replays the whole
+						// committed transcript (and clears native scrollback on direct
+						// terminals), which blocks on PTY backpressure for tens of seconds
+						// on long sessions — the selector opens invisibly and double-Esc
+						// reads as dead. O(viewport) is enough to settle the editor-slot swap.
+						this.ctx.ui.requestRender(true);
 						this.ctx.lastEscapeTime = 0;
 					} else {
 						this.ctx.lastEscapeTime = now;
@@ -493,7 +548,7 @@ export class InputController {
 			this.ctx.keybindings.getKeys("app.clipboard.pasteTextRaw"),
 		);
 		this.ctx.editor.onPasteTextRaw = () => void this.handleClipboardTextRawPaste();
-		this.ctx.editor.onLargePaste = (text, lineCount) => this.handleLargePaste(text, lineCount);
+		this.ctx.editor.onLargePaste = (text, lineCount, options) => this.handleLargePaste(text, lineCount, options);
 		this.ctx.editor.setActionKeys(
 			"app.clipboard.copyPrompt",
 			this.ctx.keybindings.getKeys("app.clipboard.copyPrompt"),
@@ -574,6 +629,7 @@ export class InputController {
 		this.#setupEnhancedPaste();
 
 		this.ctx.editor.onChange = (text: string) => {
+			this.#draftText = text;
 			const wasBashMode = this.ctx.isBashMode;
 			const wasPythonMode = this.ctx.isPythonMode;
 			const trimmed = text.trimStart();
@@ -601,6 +657,93 @@ export class InputController {
 		if (this.#detectLeftDoubleTap()) {
 			void this.ctx.unfocusSession();
 		}
+	}
+
+	/**
+	 * Inline click-to-focus (`tui.mouse`): left-clicks on live subagent cards
+	 * and HUD rows focus that agent in one action, and pointer motion lights up
+	 * the hover band on the target under the cursor. Every SGR report is consumed
+	 * while inline tracking owns the terminal so button/wheel bytes never reach
+	 * the editor as typed input; clicks on chrome simply swallow.
+	 */
+	#handleInlineMouse(data: string): { consume?: boolean; data?: string } | undefined {
+		if (!data.startsWith("\x1b[<")) return undefined;
+		if (!settings.get("tui.mouse")) return undefined;
+		if (this.ctx.ui.hasOverlay()) return undefined;
+		const event = parseSgrMouse(data);
+		if (!event) return undefined;
+		if (event.motion) this.#updateHoverHighlight(event.row);
+		else if (event.leftClick) this.#focusClickedAgent(event.row);
+		return { consume: true };
+	}
+
+	/**
+	 * Track the hovered click target, repainting only when it changes. The band
+	 * is id-anchored in the composer, so it follows an agent whose rows shift
+	 * while streaming; pointing at chrome clears it.
+	 */
+	#updateHoverHighlight(screenRow: number): void {
+		const hovered = this.#viewportCandidates(screenRow)[0];
+		if (hovered === this.#lastHoverClickId) return;
+		this.#lastHoverClickId = hovered;
+		this.ctx.setClickHoverId(hovered);
+		this.ctx.ui.requestRender();
+	}
+
+	// Candidates under a screen row, or none when the published viewport is
+	// empty (resize transactions) or the row falls outside it: routing stale
+	// spans would highlight or focus an unrelated agent from old rows.
+	#viewportCandidates(screenRow: number): string[] {
+		const viewport = this.ctx.ui.getMutableViewport();
+		const local = screenRow - viewport.top;
+		if (viewport.length === 0 || local < 0 || local >= viewport.length) return [];
+		return this.ctx.resolveViewportClickCandidates(local);
+	}
+
+	/**
+	 * Forget the last hovered target without repainting. Disabling mouse
+	 * capture clears the composer's band, but with reporting off no motion
+	 * event will ever refresh this cache — so a re-enable plus motion over
+	 * the same card would look unchanged and skip restoring the band.
+	 */
+	clearHoverHighlight(): void {
+		this.#lastHoverClickId = undefined;
+	}
+
+	#focusClickedAgent(screenRow: number): void {
+		const candidates = this.#viewportCandidates(screenRow);
+		if (candidates.length === 0) return;
+		const refs = AgentRegistry.global().list();
+		const scoped = refs.filter(ref => candidates.includes(ref.id));
+		// A live agent wins over the expander sentinel: task names are
+		// user-controlled, so an agent id can equal the toggle id. The toggle
+		// row itself names no agent and still toggles.
+		if (candidates.includes(PINNED_HUD_TOGGLE_ID) && scoped.length === 0) {
+			this.ctx.togglePinnedHudExpanded();
+			return;
+		}
+		// No global fallback: when every candidate is gone (aborted, released),
+		// focusing an unrelated recent agent would open something other than
+		// what the click displayed.
+		const nextId = pickRecentFocusableAgentId(scoped, this.ctx.focusedAgentId);
+		if (nextId === undefined) {
+			this.ctx.showStatus("That subagent is gone — open the hub for live agents");
+			return;
+		}
+		this.#focusResolvedAgent(nextId);
+	}
+
+	/** Focus a resolved agent id, ignoring already-viewing and surfacing errors as status. */
+	#focusResolvedAgent(nextId: string): void {
+		if (nextId === this.ctx.focusedAgentId) {
+			// Reaffirming the current view is still the user's latest click: a
+			// parked agent reviving from an older click must not land over it.
+			this.ctx.invalidatePendingFocus();
+			return;
+		}
+		void this.ctx.focusAgentSession(nextId).catch((error: unknown) => {
+			this.ctx.showStatus(error instanceof Error ? error.message : String(error));
+		});
 	}
 
 	/**
@@ -777,6 +920,7 @@ export class InputController {
 
 			// Handle built-in slash commands
 			if (text) {
+				this.#recordSlashCommandUsage(text);
 				const input =
 					(inputImages?.length ?? 0) > 0 || (inputImageLinks?.length ?? 0) > 0
 						? { images: inputImages, imageLinks: inputImageLinks }
@@ -874,18 +1018,19 @@ export class InputController {
 				}
 			}
 
-			// While loop mode is on, every user-typed prompt becomes the new loop
-			// prompt that auto-resubmits after each yield.
-			if (this.ctx.loopModeEnabled) {
-				this.ctx.setLoopPrompt(text);
-			}
-
 			// Queue input during compaction
 			if (this.ctx.session.isCompacting) {
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
 				this.ctx.queueCompactionMessage(text, "steer", images);
+				// An inline `/loop` body queued here arms the loop only when it is
+				// an actual model prompt. Skill/bash/python bodies never reach this
+				// branch, but an extension-command body would otherwise be retained
+				// as loopPrompt while the drain executes it locally — and idle
+				// submissions never arm commands.
+				if (submittedMode === "loop" && !this.#isLocalExtensionCommand(text)) this.ctx.setLoopPrompt(text);
 				return;
 			}
+
 			// Extension commands are local actions. Execute them before the normal
 			// submission path creates an optimistic user message; otherwise a
 			// consumed command remains rendered like a prompt sent to the model.
@@ -921,11 +1066,17 @@ export class InputController {
 				// typed since queuing intact. Same protection as #783, applied to
 				// the streaming/queue path.
 				try {
-					await this.ctx.withLocalSubmission(
+					const forwarded = await this.ctx.withLocalSubmission(
 						text,
 						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
 						{ imageCount: images?.length ?? 0 },
 					);
+					// An inline `/loop` body arms the loop only after dispatch
+					// confirms it was forwarded: arming before the await would
+					// retain a body whose dispatch rejects, resubmitting a failed
+					// prompt after every yield. A rejection leaves prior loop
+					// state untouched, so the previous body (if any) survives.
+					if (submittedMode === "loop" && forwarded) this.ctx.setLoopPrompt(text);
 				} catch (error) {
 					// Don't lose the queued steer draft: restore images then the collapsed
 					// text so chip tokens (and band cards) survive the retry.
@@ -943,8 +1094,16 @@ export class InputController {
 				this.ctx.ui.requestRender();
 				return;
 			}
-
 			// Normal message submission
+			// While loop mode is on, an idle user-typed prompt becomes the new loop
+			// prompt that auto-resubmits after each yield. This arms synchronously,
+			// before any await: arming after a turn-length dispatch would race the
+			// reschedule timer and strand the waiter. Non-forward outcomes (local
+			// consume, rejection) park the loop at their own dispatch sites, so a
+			// failed body degrades to idle instead of looping errors.
+			if (this.ctx.loopModeEnabled) {
+				this.ctx.setLoopPrompt(text);
+			}
 			// First, move any pending bash components to chat
 			this.ctx.flushPendingBashComponents();
 
@@ -986,13 +1145,17 @@ export class InputController {
 				this.ctx.editor.pendingImageLinks = [];
 				this.#maybeStartTitleGeneration(text);
 				try {
-					await this.ctx.withLocalSubmission(
+					const forwarded = await this.ctx.withLocalSubmission(
 						text,
 						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
 						{
 							imageCount: images?.length ?? 0,
 						},
 					);
+					// The idle block above already armed this body synchronously.
+					// A locally-consumed dispatch starts no turn: park the armed
+					// loop instead of resubmitting a local action on next idle.
+					if (!forwarded && this.ctx.loopPrompt === text) this.ctx.pauseLoop();
 				} catch (error) {
 					// Don't lose the message: hand images then collapsed text back to the
 					// editor so the user can retry (e.g. prompt dispatch rejecting an
@@ -1006,6 +1169,9 @@ export class InputController {
 					}
 					this.ctx.editor.setCollapsedText(text);
 					this.ctx.showError(error instanceof Error ? error.message : String(error));
+					// Dispatch rejected after the body was armed: park it so the
+					// failed prompt is not resubmitted on next idle.
+					if (this.ctx.loopPrompt === text) this.ctx.pauseLoop();
 				}
 				this.ctx.updatePendingMessagesDisplay();
 				this.ctx.ui.requestRender();
@@ -1033,9 +1199,9 @@ export class InputController {
 		if (this.#isLocalExtensionCommand(text)) {
 			return;
 		}
-		this.ctx.session.maybeStartTitleGeneration(text, () => {
-			this.#showTinyTitleDownloadProgress(this.ctx.settings.get("providers.tinyModel"));
-		});
+		this.ctx.session.maybeStartTitleGeneration(text, () =>
+			this.#showTinyTitleDownloadProgress(this.ctx.settings.get("providers.tinyModel")),
+		);
 	}
 
 	/** Submit editor text to the focused subagent session (chat-only focus policy). */
@@ -1128,11 +1294,19 @@ export class InputController {
 			return;
 		}
 
+		// TUI teardown pauses stdin, which leaves Bun with no referenced handles
+		// while the editor waits on an unresolved Promise. Keep the event loop
+		// alive across SIGSTOP so it can deliver SIGCONT; without this handle Bun
+		// exits successfully immediately after `fg` instead of restarting the TUI
+		// (issue #8585).
+		const suspendKeepalive = setInterval(() => {}, 2 ** 30);
+
 		// Capture the listener so we can detach it if the signal never fires;
 		// otherwise a failed suspend would leave a stale SIGCONT handler that
 		// fires on the next unrelated continue and tries to re-`start()` an
 		// already-running TUI.
 		const onResume = (): void => {
+			clearInterval(suspendKeepalive);
 			this.ctx.ui.start();
 			this.ctx.ui.requestRender(true);
 		};
@@ -1175,6 +1349,7 @@ export class InputController {
 			// their own sessions, so pgid=0 does not reach them.
 			process.kill(0, "SIGSTOP");
 		} catch (err) {
+			clearInterval(suspendKeepalive);
 			// The runtime refused the signal (e.g. seccomp filter blocks SIGSTOP
 			// delivery to the process group). Tear the resume hook down and
 			// bring the TUI back so the user is not stranded on a frozen prompt.
@@ -1555,21 +1730,28 @@ export class InputController {
 		return allQueued.length;
 	}
 
-	async #insertPendingImage(imageData: ImageContent): Promise<void> {
-		const image: ImageContent = { type: "image", data: imageData.data, mimeType: imageData.mimeType };
-		const imageLink = (
-			await materializeImageReferenceLinks([image], this.ctx.sessionManager.putBlob.bind(this.ctx.sessionManager))
-		)?.[0];
+	async #insertPendingImage(imageData: ImageContent, videoPath?: string): Promise<void> {
+		const image: ImageContent = videoPath
+			? createVideoPreviewImage(imageData, videoPath)
+			: { type: "image", data: imageData.data, mimeType: imageData.mimeType };
+		const imageLink =
+			videoPath ??
+			(
+				await materializeImageReferenceLinks([image], this.ctx.sessionManager.putBlob.bind(this.ctx.sessionManager))
+			)?.[0];
 		this.ctx.editor.pendingImages.push(image);
 		this.ctx.editor.pendingImageLinks.push(imageLink);
 		this.ctx.editor.imageLinks = this.ctx.editor.pendingImageLinks;
 		const imageNum = this.ctx.editor.pendingImages.length;
 		const dims = await this.#imageDimensions(imageData);
 		setCachedImageDimensions(image, dims ?? null);
+		const kind = videoPath === undefined ? "image" : "video";
 		// The buffer holds the compact chip token; the atom table expands it to the bracketed
 		// marker (the wire/transcript format) on submit.
-		const expansion = dims ? `[Image #${imageNum}, ${dims.width}x${dims.height}]` : `[Image #${imageNum}]`;
-		this.ctx.editor.insertAtom(chipLabel("image", imageNum), expansion);
+		const expansion = dims
+			? `[${kind === "video" ? "Video" : "Image"} #${imageNum}, ${dims.width}x${dims.height}]`
+			: `[${kind === "video" ? "Video" : "Image"} #${imageNum}]`;
+		this.ctx.editor.insertAtom(chipLabel(kind, imageNum), expansion);
 		this.ctx.ui.requestRender();
 	}
 
@@ -1585,11 +1767,11 @@ export class InputController {
 		return undefined;
 	}
 
-	async #normalizeAndInsertPastedImage(image: ImageContent, unsupportedMessage: string): Promise<boolean> {
+	async #normalizePastedImage(image: ImageContent, unsupportedMessage: string): Promise<ImageContent | null> {
 		let imageData = await ensureSupportedImageInput(image);
 		if (!imageData) {
 			this.ctx.showStatus(unsupportedMessage);
-			return false;
+			return null;
 		}
 		if (settings.get("images.autoResize")) {
 			try {
@@ -1603,7 +1785,13 @@ export class InputController {
 				// Keep the normalized image when resize fails.
 			}
 		}
-		await this.#insertPendingImage(imageData);
+		return imageData;
+	}
+
+	async #normalizeAndInsertPastedImage(image: ImageContent, unsupportedMessage: string): Promise<boolean> {
+		const normalized = await this.#normalizePastedImage(image, unsupportedMessage);
+		if (!normalized) return false;
+		await this.#insertPendingImage(normalized);
 		return true;
 	}
 
@@ -1620,6 +1808,33 @@ export class InputController {
 	 * the outcome (image attached, or an unsupported-format status surfaced), so
 	 * the caller stops without emitting its own degraded diagnostic.
 	 */
+	/**
+	 * Attach a pasted video path as a contact-sheet preview grid through the
+	 * image pipeline. A missing ffmpeg (or probe failure) degrades to a text
+	 * paste with an actionable status; ENOENT propagates to the caller's
+	 * clipboard-fallback handling.
+	 */
+	async #insertPendingVideoPreview(pastedPath: string): Promise<void> {
+		try {
+			const absolutePath = resolveReadPath(pastedPath, this.ctx.sessionManager.getCwd());
+			const meta = await probeVideo(absolutePath);
+			const sheet = await buildVideoContactSheetPng(absolutePath, meta);
+			const preview = await this.#normalizePastedImage(
+				{ type: "image", data: sheet.png.data, mimeType: sheet.png.mimeType },
+				"Unsupported pasted video preview format",
+			);
+			if (preview) await this.#insertPendingImage(preview, absolutePath);
+		} catch (error) {
+			if (error instanceof VideoError) {
+				this.ctx.editor.pasteText(pastedPath);
+				this.ctx.ui.requestRender();
+				this.ctx.showStatus(error.message);
+				return;
+			}
+			throw error;
+		}
+	}
+
 	async #tryPasteClipboardImage(): Promise<boolean> {
 		const env = process.env;
 		if (env.SSH_CONNECTION || env.SSH_TTY || env.SSH_CLIENT) return false;
@@ -1638,6 +1853,10 @@ export class InputController {
 
 	async handleImagePathPaste(path: string): Promise<void> {
 		try {
+			if (isVideoPath(path)) {
+				await this.#insertPendingVideoPreview(path);
+				return;
+			}
 			const image = await loadImageInput({
 				path,
 				cwd: this.ctx.sessionManager.getCwd(),
@@ -1699,6 +1918,7 @@ export class InputController {
 	}
 
 	async handleImagePaste(): Promise<boolean> {
+		let finishPaste: ((text: string | undefined) => boolean) | undefined;
 		try {
 			// When a modal paste-capable prompt (login/API-key Input) owns focus,
 			// only clipboard text may land there. Image payloads must not mutate
@@ -1707,6 +1927,7 @@ export class InputController {
 			const focusedNow = this.ctx.ui.getFocused();
 			const promptTarget =
 				focusedNow && focusedNow !== this.ctx.editor && hasPasteText(focusedNow) ? focusedNow : null;
+			finishPaste = promptTarget?.beginPaste?.();
 			// #8769: On macOS, Finder `Cmd+C` on an image file puts BOTH a
 			// `public.file-url` representation and a generated 1024x1024
 			// file-icon bitmap on the pasteboard. `arboard::get_image()`
@@ -1775,15 +1996,23 @@ export class InputController {
 				await this.handleImagePathPaste(imagePath);
 				return true;
 			}
-			// Route to the focused component when it accepts pastes (modal
-			// Input prompts), matching the enhanced-paste text path (#2127).
-			const target = promptTarget ?? this.ctx.editor;
-			target.pasteText(text);
+			// Keep the initiating prompt as the only possible modal destination.
+			if (promptTarget && this.ctx.ui.getFocused() !== promptTarget) return false;
+			if (finishPaste) {
+				const accepted = finishPaste(text);
+				finishPaste = undefined;
+				if (!accepted) return false;
+			} else {
+				const target = promptTarget ?? this.ctx.editor;
+				target.pasteText(text);
+			}
 			this.ctx.ui.requestRender();
 			return true;
 		} catch {
 			this.ctx.showStatus("Failed to read clipboard");
 			return false;
+		} finally {
+			finishPaste?.(undefined);
 		}
 	}
 
@@ -1806,10 +2035,12 @@ export class InputController {
 	 * `true` to intercept (the editor skips its default `[Paste]` marker) once the paste reaches the
 	 * configured `paste.largeMenuThreshold` line count; otherwise `false` for default collapse-to-marker
 	 * behavior. The async menu is fired and forgotten — the editor only needs the synchronous verdict.
+	 * A paste whose input burst already carries the submit key skips the menu: nobody can answer it
+	 * before the submit lands, so the paste is staged the way cancelling the menu would.
 	 */
-	handleLargePaste(text: string, lineCount: number): boolean {
+	handleLargePaste(text: string, lineCount: number, options: PasteOptions = {}): boolean {
 		const threshold = this.ctx.settings.get("paste.largeMenuThreshold");
-		if (!(threshold > 0) || lineCount < threshold) {
+		if (!(threshold > 0) || lineCount < threshold || options.submitAfterPaste) {
 			// Below the menu threshold: stage the paste as a text-attachment chip
 			// (compact token in the buffer, band card above the editor).
 			this.ctx.editor.insertTextAttachment(text);
@@ -1897,10 +2128,47 @@ export class InputController {
 		}
 	}
 
+	/**
+	 * Record a usage hit for a submitted known slash command so autocomplete
+	 * can rank frequent commands first. Builtin aliases canonicalize to the
+	 * primary name; skill/custom/file/template commands record their full
+	 * first token (which may contain `:`).
+	 */
+	#recordSlashCommandUsage(text: string): void {
+		if (!text.startsWith("/")) return;
+		const token = text.slice(1).split(/\s+/, 1)[0] ?? "";
+		if (!token) return;
+		const session = this.ctx.session;
+		const knownToken =
+			this.ctx.skillCommands.has(token) ||
+			this.ctx.fileSlashCommands.has(token) ||
+			session.extensionRunner?.getCommand(token) !== undefined ||
+			session.customCommands.some(loaded => loaded.command.name === token) ||
+			session.promptTemplates.some(template => template.name === token);
+		if (knownToken) {
+			recordSlashCommandUsage(token);
+			return;
+		}
+		const parsedName = parseSlashCommand(text)?.name;
+		const builtin = parsedName ? lookupBuiltinSlashCommand(parsedName) : undefined;
+		if (builtin) recordSlashCommandUsage(builtin.name);
+	}
+
 	createAutocompleteProvider(commands: SlashCommand[], basePath: string): AutocompleteProvider {
+		void loadSlashCommandUsage();
 		return createPromptActionAutocompleteProvider({
 			commands,
 			basePath,
+			commandUsage: getSlashCommandUsage,
+			// This TUI host uses the default registry; the receiving session can change with focus.
+			internalUrlCaller: () => {
+				const manager = this.ctx.viewSession.sessionManager;
+				return {
+					cwd: manager.getCwd(),
+					sessionId: manager.getSessionId(),
+					sessionFile: manager.getSessionFile(),
+				};
+			},
 			keybindings: this.ctx.keybindings,
 			copyCurrentLine: () => this.handleCopyCurrentLine(),
 			copyPrompt: () => this.handleCopyPrompt(),
@@ -1999,6 +2267,7 @@ export class InputController {
 			return;
 		}
 		this.setToolsExpanded(!this.ctx.toolOutputExpanded);
+		this.ctx.showStatus(`Tool output expansion: ${this.ctx.toolOutputExpanded ? "enabled" : "disabled"}`);
 	}
 
 	toggleToolActivityVisibility(): void {
@@ -2022,7 +2291,7 @@ export class InputController {
 		this.ctx.chatContainer.setToolActivityVisible(!this.ctx.hideToolActivity);
 
 		if (this.ctx.hideToolActivity) this.ctx.ui.clearInlineImages();
-		this.ctx.ui.resetDisplay();
+		this.ctx.ui.requestRender(true);
 		this.ctx.showStatus(`Tool activity: ${this.ctx.hideToolActivity ? "hidden" : "visible"}`);
 	}
 
@@ -2033,15 +2302,9 @@ export class InputController {
 				child.setExpanded(expanded);
 			}
 		}
-		// Toggling expansion mutates every block, but on ED3-risk terminals the
-		// transcript freezes a snapshot of each block once it scrolls past the live
-		// region (committed native scrollback is immutable there). A plain repaint
-		// replays those stale snapshots, so the toggle appears to do nothing above
-		// the live block. resetDisplay() invalidates the snapshots and forces a
-		// full clear + replay — the keyboard-accessible resize-reset equivalent —
-		// which is the only path that re-emits the whole transcript at its new
-		// heights.
-		this.ctx.ui.resetDisplay();
+		// Toggling expansion mutates every live block; blocks already committed to
+		// terminal history stay at their committed presentation.
+		this.ctx.ui.requestRender(true);
 	}
 
 	toggleThinkingBlockVisibility(): void {
@@ -2070,12 +2333,13 @@ export class InputController {
 			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage);
 		}
 
-		// Every block now carries the new flag, but on ED3-risk terminals the
-		// blocks that scrolled past the live region are frozen snapshots in
-		// committed scrollback — a plain repaint replays them stale, so scrolling
-		// up still shows the old thinking expanded. resetDisplay() retires those
-		// snapshots (it invalidates every block) and forces a full clear + replay
-		// of the whole transcript, matching setToolsExpanded()'s redraw.
+		// This is an explicit user display gesture: rebuild native history so the
+		// visibility change also applies to rows already retired from the viewport.
+		// Append-only thinking heads emitted their stable rows to scrollback while
+		// streaming (visible); forget that emission ledger so the paired scrollback
+		// clear re-renders them under the new visibility instead of replaying the
+		// captured reasoning (#10177).
+		this.ctx.chatContainer.resetStableEmission();
 		this.ctx.ui.resetDisplay();
 
 		this.ctx.showStatus(`Thinking blocks: ${this.ctx.hideThinkingBlock ? "hidden" : "visible"}`);
@@ -2115,7 +2379,7 @@ export class InputController {
 			this.ctx.editor.setCustomKeyHandler(keyId, () => {
 				const ctx = runner.createCommandContext();
 				try {
-					shortcut.handler(ctx);
+					runner.runScoped(() => shortcut.handler(ctx));
 				} catch (err) {
 					runner.emitError({
 						extensionPath: shortcut.extensionPath,

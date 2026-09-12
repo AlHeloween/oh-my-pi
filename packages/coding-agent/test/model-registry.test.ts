@@ -6,6 +6,10 @@ import * as path from "node:path";
 import { Effort, type FetchImpl, type Model, type OpenAICompat, type ThinkingConfig } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import { fingerprintStaticModels } from "@oh-my-pi/pi-catalog/model-manager";
+import { calculateUsageCost, getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import { finalizeCustomModel } from "@oh-my-pi/pi-coding-agent/config/custom-models";
+import { applyModelPatch } from "@oh-my-pi/pi-coding-agent/config/model-patch";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -734,6 +738,51 @@ describe("ModelRegistry", () => {
 			expect(getReplayUnsignedThinking(registry.find("anthropic", "claude-sonnet-5"))).toBe(false);
 		});
 
+		test("catalog metrics enrich models discovered through a custom provider", async () => {
+			// Metrics only fill unscored models, so the id must be absent from the
+			// bundled catalog — otherwise a regen that scores it silently wins here.
+			writeRawModelsJson({
+				cliproxy: {
+					baseUrl: "https://proxy.example/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+					models: [],
+				},
+			});
+			const fetchMock: FetchImpl = async input => {
+				const url = String(input);
+				if (url === "https://catalog.stencil.so/models.json.zstd") {
+					return Response.json({
+						openai: {
+							id: "openai",
+							name: "OpenAI",
+							models: {
+								"gpt-5.7-sol": {
+									id: "gpt-5.7-sol",
+									name: "GPT-5.7 Sol",
+									tool_call: true,
+									int: 60.9,
+									tps: 70.4,
+								},
+							},
+						},
+					});
+				}
+				if (url === "https://proxy.example/v1/models") {
+					return Response.json({ data: [{ id: "gpt-5.7-sol" }] });
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			};
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+			await registry.refresh("online");
+
+			const model = registry.find("cliproxy", "gpt-5.7-sol");
+			expect(model?.int).toBe(60.9);
+			expect(model?.tps).toBe(70.4);
+		});
+
 		test("custom Responses providers can disable original image detail", () => {
 			const model = customResponsesCompat.find("cc-switch", "gpt-5.5");
 			const compat = getOpenAICompat(model);
@@ -1254,6 +1303,7 @@ describe("ModelRegistry", () => {
 		let addHeaders: ModelRegistry;
 		let omitOnBuiltin: ModelRegistry;
 		let omitOnCustom: ModelRegistry;
+		let scheduledPrices: ModelRegistry;
 		beforeAll(() => {
 			single = readonlyRegistry({
 				providers: {
@@ -1315,6 +1365,25 @@ describe("ModelRegistry", () => {
 			});
 			costPartial = readonlyRegistry({
 				providers: { openai: { modelOverrides: { "gpt-5.6": { cost: { input: 99 } } } } },
+			});
+			scheduledPrices = readonlyRegistry({
+				providers: {
+					deepseek: {
+						api: "openai-completions",
+						baseUrl: "https://api.deepseek.com",
+						auth: "none",
+						modelOverrides: {
+							"deepseek-v4-flash": { name: "Renamed Flash" },
+							"deepseek-v4-pro": { cost: { input: 8, output: 16, cacheRead: 2, cacheWrite: 0 } },
+						},
+						models: [
+							{
+								id: "deepseek-v4-flash-vision-exp",
+								cost: { input: 4, output: 8, cacheRead: 1, cacheWrite: 0 },
+							},
+						],
+					},
+				},
 			});
 			addHeaders = readonlyRegistry({
 				providers: {
@@ -1449,6 +1518,44 @@ describe("ModelRegistry", () => {
 				input: 10,
 				output: 45,
 			});
+		});
+
+		test("non-price overrides keep scheduled rates while user prices stay fixed across tariff changes", () => {
+			expect(scheduledPrices.getError()).toBeUndefined();
+			const renamed = scheduledPrices.find("deepseek", "deepseek-v4-flash");
+			const overridden = scheduledPrices.find("deepseek", "deepseek-v4-pro");
+			const custom = scheduledPrices.find("deepseek", "deepseek-v4-flash-vision-exp");
+			if (!renamed || !overridden || !custom) throw new Error("Expected configured DeepSeek models");
+			const standalone = finalizeCustomModel(
+				{
+					id: "deepseek-v4-pro",
+					provider: "deepseek",
+					api: overridden.api,
+					baseUrl: overridden.baseUrl,
+					cost: { input: 3, output: 6, cacheRead: 1, cacheWrite: 0 },
+				},
+				{ useDefaults: true },
+			);
+			const repatched = applyModelPatch(overridden, { contextWindow: 250_000 }, "merge");
+			const usage = {
+				input: 1_000_000,
+				output: 1_000_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2_000_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			};
+			const peak = Date.parse("2026-09-10T03:00:00Z");
+			const offPeak = Date.parse("2026-09-10T04:00:00Z");
+			const afterRateChange = Date.parse("2026-09-14T04:00:00Z");
+			expect(calculateUsageCost(renamed.cost, usage, peak).total).toBeCloseTo(1.5, 8);
+			expect(calculateUsageCost(renamed.cost, usage, offPeak).total).toBeCloseTo(0.75, 8);
+			for (const timestamp of [peak, offPeak, afterRateChange]) {
+				expect(calculateUsageCost(overridden.cost, usage, timestamp).total).toBe(24);
+				expect(calculateUsageCost(custom.cost, usage, timestamp).total).toBe(12);
+				expect(calculateUsageCost(standalone.cost, usage, timestamp).total).toBe(9);
+				expect(calculateUsageCost(repatched.cost, usage, timestamp).total).toBe(24);
+			}
 		});
 
 		test("model override can add headers", () => {
@@ -1664,7 +1771,226 @@ describe("ModelRegistry", () => {
 		});
 	});
 	describe("extended context", () => {
-		test("off caps premium long-context models at the standard-pricing threshold", async () => {
+		const thinking: ThinkingConfig = {
+			mode: "effort",
+			efforts: [Effort.Low, Effort.Medium],
+			defaultLevel: Effort.Low,
+		};
+
+		test.each(
+			[
+				["openai-codex", "gpt-6-astra"],
+				["openai-codex", "gpt-5.6-luna"],
+				["anthropic", "claude-opus-5"],
+				["anthropic", "claude-mythos-5"],
+				["amazon-bedrock", "anthropic.claude-opus-5"],
+				["amazon-bedrock", "au.anthropic.claude-opus-5"],
+				["amazon-bedrock", "eu.anthropic.claude-opus-5"],
+				["amazon-bedrock", "global.anthropic.claude-opus-5"],
+				["amazon-bedrock", "us-gov.anthropic.claude-opus-5"],
+				["amazon-bedrock", "us.anthropic.claude-opus-5"],
+				["amazon-bedrock", "global.openai.gpt-5.6-luna"],
+				["bedrock-mantle", "openai.gpt-5.6-luna"],
+			].flatMap(([provider, id]) => [false, true].map(extendedContext => [provider, id, extendedContext] as const)),
+		)("%s/%s extendedContext=%j preserves capacity across effort restrictions", (provider, id, extendedContext) => {
+			const testSettings = Settings.isolated({ extendedContext });
+			const baselineRegistry = new ModelRegistry(authStorage, modelsJsonPath, { settings: testSettings });
+			const baseline = baselineRegistry.find(provider, id);
+			expect(baseline).toBeDefined();
+			if (!baseline?.thinking) throw new Error(`Missing thinking-capable model: ${provider}/${id}`);
+			const overrideThinking: ThinkingConfig = {
+				...baseline.thinking,
+				efforts: [Effort.Low, Effort.Medium],
+				defaultLevel: Effort.Low,
+			};
+			writeRawModelsJson({
+				[provider]: { modelOverrides: { [id]: { thinking: overrideThinking } } },
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { settings: testSettings });
+			const actual = registry.find(provider, id);
+			expect(actual?.thinking).toEqual(overrideThinking);
+			expect(actual?.contextWindow).toBe(baseline.contextWindow);
+			expect(actual?.maxTokens).toBe(baseline.maxTokens);
+		});
+
+		test("preserves Astra capacity with a thinking-only override across policy toggles", async () => {
+			writeRawModelsJson({
+				"openai-codex": { modelOverrides: { "gpt-6-astra": { thinking } } },
+			});
+			const testSettings = Settings.isolated();
+			testSettings.set("extendedContext", true);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { settings: testSettings });
+			expect(registry.find("openai-codex", "gpt-6-astra")?.thinking).toEqual(thinking);
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(922_000);
+
+			testSettings.set("extendedContext", false);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(272_000);
+
+			testSettings.set("extendedContext", true);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(922_000);
+			expect(registry.find("openai-codex", "gpt-6-astra")?.thinking).toEqual(thinking);
+		});
+
+		test("toggles bundled Astra between its standard and documented extended windows", async () => {
+			const testSettings = Settings.isolated();
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { settings: testSettings });
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(272_000);
+
+			testSettings.set("extendedContext", true);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(922_000);
+			expect(registry.find("openai-codex", "gpt-5.5")?.contextWindow).toBe(272_000);
+
+			testSettings.set("extendedContext", false);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(272_000);
+		});
+
+		test("keeps bundled Astra at its default window without a settings source", () => {
+			// `beforeEach` leaves global settings uninitialized, so this
+			// reaches the no-settings fallback: it must match the schema
+			// default (off), never silently elevated windows.
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(272_000);
+		});
+
+		test("preserves an explicit Astra context override across extended context toggles", async () => {
+			writeRawModelsJson({
+				"openai-codex": { modelOverrides: { "gpt-6-astra": { contextWindow: 400_000, thinking } } },
+			});
+			const testSettings = Settings.isolated();
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { settings: testSettings });
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(400_000);
+
+			testSettings.set("extendedContext", true);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(400_000);
+
+			testSettings.set("extendedContext", false);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(400_000);
+		});
+
+		test("clamps an explicit Astra override to the Codex ceiling", async () => {
+			writeRawModelsJson({
+				"openai-codex": { modelOverrides: { "gpt-6-astra": { contextWindow: 2_000_000, thinking } } },
+			});
+			const testSettings = Settings.isolated({ extendedContext: true });
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { settings: testSettings });
+			// Explicit intent wins over the toggle, but upstream never honors
+			// more than the server ceiling (curated 922K input cap here).
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(922_000);
+		});
+
+		test("clamps a cached Astra row already carrying the applied override", async () => {
+			writeRawModelsJson({
+				"openai-codex": { modelOverrides: { "gpt-6-astra": { contextWindow: 2_000_000 } } },
+			});
+			const testSettings = Settings.isolated({ extendedContext: true });
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { settings: testSettings });
+			const astra = registry.find("openai-codex", "gpt-6-astra");
+			if (!astra) throw new Error("Expected bundled Astra model");
+			// Wire-value row, as discovery persists it; the cache loader
+			// applies the models.yml override before composition sees it, so
+			// the clamp must hold on every override pass, not just the last.
+			writeModelCache(
+				"openai-codex",
+				Date.now(),
+				[{ ...astra, contextWindow: 272_000, maxContextWindow: 872_000 }],
+				true,
+				"",
+				path.join(tempDir, "models.db"),
+			);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(922_000);
+		});
+
+		test("restores the opt-in for cached Astra and worker rows with stale or invalid maxima", async () => {
+			const testSettings = Settings.isolated();
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { settings: testSettings });
+			const astra = registry.find("openai-codex", "gpt-6-astra");
+			if (!astra) throw new Error("Expected bundled Astra model");
+			writeModelCache(
+				"openai-codex",
+				Date.now(),
+				[
+					{ ...astra, contextWindow: 1_050_000, maxContextWindow: 872_000 },
+					{ ...astra, id: "gpt-6-astra-wm", contextWindow: 1_050_000, maxContextWindow: 0 },
+				],
+				true,
+				"",
+				path.join(tempDir, "models.db"),
+			);
+			await registry.reapplyModelPolicies();
+			for (const id of ["gpt-6-astra", "gpt-6-astra-wm"]) {
+				expect(registry.find("openai-codex", id)?.contextWindow).toBe(272_000);
+			}
+
+			testSettings.set("extendedContext", true);
+			await registry.reapplyModelPolicies();
+			for (const id of ["gpt-6-astra", "gpt-6-astra-wm"]) {
+				expect(registry.find("openai-codex", id)?.contextWindow).toBe(922_000);
+			}
+
+			testSettings.set("extendedContext", false);
+			await registry.reapplyModelPolicies();
+			for (const id of ["gpt-6-astra", "gpt-6-astra-wm"]) {
+				expect(registry.find("openai-codex", id)?.contextWindow).toBe(272_000);
+			}
+		});
+
+		test("uses higher discovered Astra maxima without retaining them across catalog rebuilds", async () => {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+				settings: Settings.isolated({ extendedContext: true }),
+			});
+			const astra = registry.find("openai-codex", "gpt-6-astra");
+			if (!astra) throw new Error("Expected bundled Astra model");
+			const dbPath = path.join(tempDir, "models.db");
+			writeModelCache("openai-codex", Date.now(), [{ ...astra, maxContextWindow: 1_200_000 }], true, "", dbPath);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(1_200_000);
+
+			writeModelCache("openai-codex", Date.now(), [{ ...astra, maxContextWindow: 872_000 }], true, "", dbPath);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(922_000);
+		});
+
+		test("restores a discovered maximum from cache ahead of the default on each toggle", async () => {
+			const testSettings = Settings.isolated();
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { settings: testSettings });
+			const legacy = registry.find("openai-codex", "gpt-5.5");
+			const spark = registry.find("openai-codex", "gpt-5.3-codex-spark");
+			if (!legacy || !spark) throw new Error("Expected bundled Codex models");
+			writeModelCache(
+				"openai-codex",
+				Date.now(),
+				[
+					{ ...legacy, maxContextWindow: 640_000 },
+					{ ...spark, maxContextWindow: 64_000 },
+				],
+				true,
+				"",
+				path.join(tempDir, "models.db"),
+			);
+
+			testSettings.set("extendedContext", true);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("openai-codex", "gpt-5.5")?.contextWindow).toBe(640_000);
+			// An advertised maximum smaller than the current window cannot shrink it.
+			expect(registry.find("openai-codex", "gpt-5.3-codex-spark")?.contextWindow).toBe(128_000);
+
+			testSettings.set("extendedContext", false);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("openai-codex", "gpt-5.5")?.contextWindow).toBe(272_000);
+
+			testSettings.set("extendedContext", true);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("openai-codex", "gpt-5.5")?.contextWindow).toBe(640_000);
+		});
+
+		test("off caps billable premium models without shrinking subscription estimates", async () => {
 			await Settings.init({ inMemory: true, overrides: { extendedContext: false } });
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 
@@ -1673,10 +1999,13 @@ describe("ModelRegistry", () => {
 			expect(registry.find("openai-codex", "gpt-5.6-sol")?.contextWindow).toBe(272_000);
 			// Standard-priced 1M models (no long-context tier) keep their window.
 			expect(registry.find("anthropic", "claude-opus-4-8")?.contextWindow).toBe(1_000_000);
+			// SuperGrok carries public xAI tiers for stats estimates, not billing.
+			expect(registry.find("xai-oauth", "grok-4.20-0309-reasoning")?.contextWindow).toBe(2_000_000);
 		});
 
 		test("reapplyModelPolicies re-clamps and restores premium windows on toggle", async () => {
 			await Settings.init({ inMemory: true });
+			settings.set("extendedContext", true);
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			expect(registry.find("openai", "gpt-5.6-terra")?.contextWindow).toBe(1_050_000);
 
@@ -1785,6 +2114,111 @@ describe("ModelRegistry", () => {
 			const model = myProxyCustom.find("my-proxy", "claude-sonnet-4");
 			expect(model).toBeDefined();
 			expect((model?.compat as { disableStrictTools?: boolean } | undefined)?.disableStrictTools).toBe(true);
+		});
+	});
+
+	describe("amazon-bedrock guardrails", () => {
+		let guardrailOverride: ModelRegistry;
+		beforeAll(() => {
+			guardrailOverride = readonlyRegistry({
+				providers: {
+					"amazon-bedrock": {
+						guardrailIdentifier: "arn:aws:bedrock:eu-west-2:123456789012:guardrail/abcd1234",
+						guardrailVersion: "1",
+						guardrailTrace: "enabled",
+						requestMetadata: { team: "growth", environment: "prod" },
+					},
+					"custom-bedrock": {
+						baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+						apiKey: "TEST_KEY",
+						api: "bedrock-converse-stream",
+						guardrailIdentifier: "arn:aws:bedrock:eu-west-2:123456789012:guardrail/abcd1234",
+						guardrailVersion: "1",
+						guardrailTrace: "enabled",
+						requestMetadata: { team: "growth", environment: "prod" },
+						models: [
+							{
+								id: "custom-bedrock-model",
+								name: "Custom Bedrock Model",
+								reasoning: false,
+								input: ["text"],
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+								contextWindow: 128000,
+								maxTokens: 4096,
+							},
+						],
+					},
+				},
+			});
+		});
+
+		test("guardrail provider config applies to built-in bedrock models", () => {
+			const models = getModelsForProvider(guardrailOverride, "amazon-bedrock");
+			expect(models.length).toBeGreaterThan(0);
+			for (const model of models) {
+				expect(model.guardrailIdentifier).toBe("arn:aws:bedrock:eu-west-2:123456789012:guardrail/abcd1234");
+				expect(model.guardrailVersion).toBe("1");
+				expect(model.guardrailTrace).toBe("enabled");
+				expect(model.requestMetadata).toEqual({ team: "growth", environment: "prod" });
+			}
+		});
+
+		test("guardrail provider config applies to a non-bundled Bedrock model", () => {
+			const model = guardrailOverride.find("custom-bedrock", "custom-bedrock-model");
+			expect(model).toBeDefined();
+			expect(model?.guardrailIdentifier).toBe("arn:aws:bedrock:eu-west-2:123456789012:guardrail/abcd1234");
+			expect(model?.guardrailVersion).toBe("1");
+			expect(model?.guardrailTrace).toBe("enabled");
+			expect(model?.requestMetadata).toEqual({ team: "growth", environment: "prod" });
+		});
+
+		test("guardrail fields are absent on built-in bedrock models without override", () => {
+			const models = getModelsForProvider(sharedBuiltin, "amazon-bedrock");
+			expect(models.length).toBeGreaterThan(0);
+			for (const model of models) {
+				expect(model.guardrailIdentifier).toBeUndefined();
+				expect(model.guardrailVersion).toBeUndefined();
+				expect(model.guardrailTrace).toBeUndefined();
+				expect(model.requestMetadata).toBeUndefined();
+			}
+		});
+
+		test("guardrail provider config applies to a synthesized inference-profile ARN model", () => {
+			const profileArn = "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/company-opus-48";
+			const model = guardrailOverride.find("amazon-bedrock", profileArn);
+			expect(model).toBeDefined();
+			expect(model?.id).toBe(profileArn);
+			expect(model?.api).toBe("bedrock-converse-stream");
+			expect(model?.guardrailIdentifier).toBe("arn:aws:bedrock:eu-west-2:123456789012:guardrail/abcd1234");
+			expect(model?.guardrailVersion).toBe("1");
+			expect(model?.guardrailTrace).toBe("enabled");
+		});
+
+		test("guardrail fields are absent on a synthesized ARN model without override", () => {
+			const profileArn = "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/company-opus-48";
+			const model = sharedBuiltin.find("amazon-bedrock", profileArn);
+			expect(model).toBeDefined();
+			expect(model?.guardrailIdentifier).toBeUndefined();
+			expect(model?.guardrailVersion).toBeUndefined();
+			expect(model?.guardrailTrace).toBeUndefined();
+		});
+
+		test("transport and header overrides apply to a synthesized ARN model", () => {
+			const transportOverride = readonlyRegistry({
+				providers: {
+					"amazon-bedrock": {
+						transport: "pi-native",
+						headers: { "X-Custom-Header": "custom-value" },
+						guardrailIdentifier: "arn:aws:bedrock:eu-west-2:123456789012:guardrail/abcd1234",
+					},
+				},
+			});
+			const profileArn = "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/company-opus-48";
+			const model = transportOverride.find("amazon-bedrock", profileArn);
+			expect(model).toBeDefined();
+			expect(model?.transport).toBe("pi-native");
+			expect(model?.headers).toEqual({ "X-Custom-Header": "custom-value" });
+			expect(model?.guardrailIdentifier).toBe("arn:aws:bedrock:eu-west-2:123456789012:guardrail/abcd1234");
 		});
 	});
 
@@ -1907,6 +2341,8 @@ describe("ModelRegistry", () => {
 		let vertexNonAuthoritative: ModelRegistry;
 		let vertexStale: ModelRegistry;
 		let litellmStaleNamespaceCache: ModelRegistry;
+		let sharedCatalogCache: ModelRegistry;
+		let staticOnlySharedCatalogCache: ModelRegistry;
 		let litellmCurrentNamespaceCache: ModelRegistry;
 		let openaiModelsListStaleNamespaceCache: ModelRegistry;
 		const vertexProjectModel = () =>
@@ -1923,6 +2359,65 @@ describe("ModelRegistry", () => {
 				maxTokens: 8_888,
 			});
 		beforeAll(() => {
+			sharedCatalogCache = readonlyRegistry(
+				{ providers: {} },
+				{
+					seedCache: dbPath => {
+						const bundledModels = getBundledModels("zai");
+						const bundledModel = bundledModels[0];
+						if (!bundledModel) throw new Error("ZAI bundled catalog is empty");
+						writeModelCache(
+							"zai",
+							Date.now(),
+							[
+								{
+									...bundledModel,
+									name: "Stale cached name",
+									contextWindow: bundledModel.contextWindow === 1 ? 2 : 1,
+									maxTokens: bundledModel.maxTokens === 1 ? 2 : 1,
+								},
+								...bundledModels.slice(1),
+								buildModel({
+									id: "glm-experimental-probe",
+									name: "GLM Experimental Probe",
+									api: "anthropic-messages",
+									provider: "zai",
+									baseUrl: "https://api.z.ai/api/anthropic",
+									reasoning: true,
+									input: ["text", "image"],
+									cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+									contextWindow: 1_000_000,
+									maxTokens: 131_072,
+								}),
+							],
+							true,
+							"merge-v3:stale-bundle",
+							dbPath,
+						);
+					},
+				},
+			);
+			staticOnlySharedCatalogCache = readonlyRegistry(
+				{ providers: {} },
+				{
+					seedCache: dbPath => {
+						for (const [providerId, dynamicModelsAuthoritative] of [
+							["zai", false],
+							["anthropic", true],
+						] as const) {
+							const bundledModels = getBundledModels(providerId);
+							writeModelCache(
+								providerId,
+								Date.now(),
+								bundledModels,
+								false,
+								fingerprintStaticModels(bundledModels, dynamicModelsAuthoritative),
+								dbPath,
+							);
+						}
+					},
+				},
+			);
 			legacySentinels = readonlyRegistry(
 				{
 					providers: {
@@ -2003,7 +2498,7 @@ describe("ModelRegistry", () => {
 								}),
 							],
 							true,
-							"",
+							fingerprintStaticModels(getBundledModels("ollama-cloud")),
 							dbPath,
 						);
 					},
@@ -2181,11 +2676,12 @@ describe("ModelRegistry", () => {
 					maxTokens: 16_384,
 				});
 			litellmStaleNamespaceCache = readonlyRegistry(litellmProxyConfig(), {
-				// Rows cached before per-model Responses routing must be orphaned
-				// instead of keeping OpenAI-backed groups on Chat Completions.
+				// Rows cached under the retired namespace whose `compatConfig`
+				// retained a colliding bundled model's provider-specific transport
+				// (issue #9938) must be orphaned instead of served.
 				seedCache: dbPath =>
 					writeModelCache(
-						"litellm-proxy:litellm-rich-v2",
+						"litellm-proxy:litellm-rich-v3",
 						Date.now(),
 						[litellmCachedModel("MiniMax-M3 (3x usage)")],
 						true,
@@ -2196,7 +2692,7 @@ describe("ModelRegistry", () => {
 			litellmCurrentNamespaceCache = readonlyRegistry(litellmProxyConfig(), {
 				seedCache: dbPath =>
 					writeModelCache(
-						"litellm-proxy:litellm-rich-v3",
+						"litellm-proxy:litellm-rich-v4",
 						Date.now(),
 						[litellmCachedModel("MiniMax-M3")],
 						true,
@@ -2282,13 +2778,13 @@ describe("ModelRegistry", () => {
 			});
 		});
 
-		test("ignores litellm discovery rows cached under the retired rich-v2 namespace", () => {
-			// Warm rich-v2 rows carry the pre-change provider-wide API and must not load.
+		test("ignores litellm discovery rows cached under the retired rich-v3 namespace", () => {
+			// Warm rich-v3 rows carry the leaked provider-specific compat and must not load.
 			expect(litellmStaleNamespaceCache.find("litellm-proxy", "minimax/minimax-m3")).toBeUndefined();
 			expect(getModelsForProvider(litellmStaleNamespaceCache, "litellm-proxy")).toHaveLength(0);
 		});
 
-		test("loads litellm discovery rows cached under the rich-v3 namespace", () => {
+		test("loads litellm discovery rows cached under the rich-v4 namespace", () => {
 			const model = litellmCurrentNamespaceCache.find("litellm-proxy", "minimax/minimax-m3");
 			expect(model?.name).toBe("MiniMax-M3");
 			expect(model?.provider).toBe("litellm-proxy");
@@ -2351,6 +2847,44 @@ describe("ModelRegistry", () => {
 			const vertexModels = getModelsForProvider(vertexStale, "google-vertex");
 			expect(vertexModels.some(model => model.id === "zai-org/glm-4.7-maas")).toBe(true);
 			expect(vertexModels.some(model => model.id.startsWith("gemini-"))).toBe(true);
+		});
+
+		test("hydrates only shared-catalog additions from cache", () => {
+			const bundledModel = getBundledModels("zai")[0];
+			if (!bundledModel) throw new Error("ZAI bundled catalog is empty");
+			expect(sharedCatalogCache.find("zai", bundledModel.id)).toMatchObject({
+				name: bundledModel.name,
+				contextWindow: bundledModel.contextWindow,
+				maxTokens: bundledModel.maxTokens,
+			});
+			expect(sharedCatalogCache.find("zai", "glm-experimental-probe")).toMatchObject({
+				contextWindow: 1_000_000,
+				maxTokens: 131_072,
+			});
+			expect(sharedCatalogCache.getProviderDiscoveryState("zai")).toMatchObject({
+				provider: "zai",
+				status: "cached",
+				optional: false,
+				stale: false,
+				source: "cache",
+			});
+		});
+
+		test("reports static-only shared-catalog startup caches as bundled", () => {
+			for (const providerId of ["zai", "anthropic"] as const) {
+				const bundledModel = getBundledModels(providerId)[0];
+				if (!bundledModel) throw new Error(`${providerId} bundled catalog is empty`);
+				expect(staticOnlySharedCatalogCache.find(providerId, bundledModel.id)).toBeDefined();
+				const discovery = staticOnlySharedCatalogCache.getProviderDiscoveryState(providerId);
+				expect(discovery).toMatchObject({
+					provider: providerId,
+					status: "unavailable",
+					optional: false,
+					stale: true,
+					source: "bundled",
+				});
+				expect(discovery?.fetchedAt).toBeUndefined();
+			}
 		});
 	});
 
